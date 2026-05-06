@@ -256,47 +256,41 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     For accumulators, use cuda.local.array((TM5, TN5), float32).
     Numba supports tuple-shaped local arrays!
     """
-    # Store As transposed (BK5 x BM5) to avoid bank conflicts when reading
-    # down columns during the outer product (threads read As[dk, row+tm])
-    As = cuda.shared.array((BK5, BM5), dtype=float32)  # transposed!
+    # Transposed As (BK5 x BM5) avoids bank conflicts on column reads
+    As = cuda.shared.array((BK5, BM5), dtype=float32)
     Bs = cuda.shared.array((BK5, BN5), dtype=float32)
 
-    tile_col = cuda.blockIdx.x   # column tile
-    tile_row = cuda.blockIdx.y   # row tile
-
+    tile_col = cuda.blockIdx.x
+    tile_row = cuda.blockIdx.y
     tid = cuda.threadIdx.x  # 0..255
 
-    # Each thread owns a TM5 x TN5 = 8x8 block of outputs
-    threads_per_row = BN5 // TN5          # = 128/8 = 16
-    thread_col = (tid % threads_per_row) * TN5   # starting col in tile
-    thread_row = (tid // threads_per_row) * TM5  # starting row in tile
+    threads_per_row = BN5 // TN5   # 16
+    thread_col = (tid % threads_per_row) * TN5
+    thread_row = (tid // threads_per_row) * TM5
 
-    # Per-thread registers
-    acc = cuda.local.array((TM5, TN5), dtype=float32)
+    # Flatten acc to 1D — Numba optimizes 1D local arrays into registers much better
+    acc = cuda.local.array(TM5 * TN5, dtype=float32)
     reg_a = cuda.local.array(TM5, dtype=float32)
     reg_b = cuda.local.array(TN5, dtype=float32)
 
-    for i in range(TM5):
-        for j in range(TN5):
-            acc[i, j] = float32(0.0)
+    for i in range(TM5 * TN5):
+        acc[i] = float32(0.0)
 
     num_chunks = (K + BK5 - 1) // BK5
     for chunk in range(num_chunks):
-        # Cooperative load of As into transposed shared mem (BK5 x BM5 = 1024 elements)
-        # Each thread loads 4 elements; stride along rows for coalesced global reads
+        # Load As transposed: 4 elements per thread, coalesced global reads
         for load_idx in range(4):
             idx = tid + load_idx * 256
-            # treat idx as indexing row-major into (BM5 x BK5) global layout
-            a_row = idx // BK5   # row in A tile (0..127)
-            a_col = idx % BK5    # col in A tile (0..7)
+            a_row = idx // BK5
+            a_col = idx % BK5
             g_row = tile_row * BM5 + a_row
             g_col = chunk * BK5 + a_col
             if g_row < M and g_col < K:
-                As[a_col, a_row] = A[g_row, g_col]  # store transposed
+                As[a_col, a_row] = A[g_row, g_col]
             else:
                 As[a_col, a_row] = float32(0.0)
 
-        # Cooperative load of Bs (BK5 x BN5 = 1024 elements, 4 per thread)
+        # Load Bs: 4 elements per thread
         for load_idx in range(4):
             idx = tid + load_idx * 256
             b_row = idx // BN5
@@ -310,25 +304,24 @@ def sgemm_2d_tile(A, B, C, M, N, K):
 
         cuda.syncthreads()
 
-        # Outer product: As is now (BK5 x BM5), so As[dk, row] is conflict-free
         for dk in range(BK5):
             for tm in range(TM5):
-                reg_a[tm] = As[dk, thread_row + tm]  # read from transposed As
+                reg_a[tm] = As[dk, thread_row + tm]
             for tn in range(TN5):
                 reg_b[tn] = Bs[dk, thread_col + tn]
             for tm in range(TM5):
                 for tn in range(TN5):
-                    acc[tm, tn] += reg_a[tm] * reg_b[tn]
+                    acc[tm * TN5 + tn] += reg_a[tm] * reg_b[tn]
 
         cuda.syncthreads()
 
-    # Write 8x8 = 64 output elements per thread
+    # Write 64 outputs
     for tm in range(TM5):
         for tn in range(TN5):
             out_row = tile_row * BM5 + thread_row + tm
             out_col = tile_col * BN5 + thread_col + tn
             if out_row < M and out_col < N:
-                C[out_row, out_col] = acc[tm, tn]
+                C[out_row, out_col] = acc[tm * TN5 + tn]
 
 
 # ── Launch wrappers (provided — do not edit) ────────────────────────
