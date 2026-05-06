@@ -256,7 +256,9 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     For accumulators, use cuda.local.array((TM5, TN5), float32).
     Numba supports tuple-shaped local arrays!
     """
-    As = cuda.shared.array((BM5, BK5), dtype=float32)
+    # Store As transposed (BK5 x BM5) to avoid bank conflicts when reading
+    # down columns during the outer product (threads read As[dk, row+tm])
+    As = cuda.shared.array((BK5, BM5), dtype=float32)  # transposed!
     Bs = cuda.shared.array((BK5, BN5), dtype=float32)
 
     tile_col = cuda.blockIdx.x   # column tile
@@ -280,20 +282,21 @@ def sgemm_2d_tile(A, B, C, M, N, K):
 
     num_chunks = (K + BK5 - 1) // BK5
     for chunk in range(num_chunks):
-        # Cooperative load of As: BM5*BK5=1024 elements, 256 threads → 4 each
-        # Stride = 256 so consecutive threads touch consecutive columns (coalesced)
+        # Cooperative load of As into transposed shared mem (BK5 x BM5 = 1024 elements)
+        # Each thread loads 4 elements; stride along rows for coalesced global reads
         for load_idx in range(4):
             idx = tid + load_idx * 256
-            a_row = idx // BK5
-            a_col = idx % BK5
+            # treat idx as indexing row-major into (BM5 x BK5) global layout
+            a_row = idx // BK5   # row in A tile (0..127)
+            a_col = idx % BK5    # col in A tile (0..7)
             g_row = tile_row * BM5 + a_row
             g_col = chunk * BK5 + a_col
             if g_row < M and g_col < K:
-                As[a_row, a_col] = A[g_row, g_col]
+                As[a_col, a_row] = A[g_row, g_col]  # store transposed
             else:
-                As[a_row, a_col] = float32(0.0)
+                As[a_col, a_row] = float32(0.0)
 
-        # Cooperative load of Bs: BK5*BN5=1024 elements, 256 threads → 4 each
+        # Cooperative load of Bs (BK5 x BN5 = 1024 elements, 4 per thread)
         for load_idx in range(4):
             idx = tid + load_idx * 256
             b_row = idx // BN5
@@ -307,13 +310,12 @@ def sgemm_2d_tile(A, B, C, M, N, K):
 
         cuda.syncthreads()
 
-        # Outer product update: cache TM5 A values and TN5 B values in registers
+        # Outer product: As is now (BK5 x BM5), so As[dk, row] is conflict-free
         for dk in range(BK5):
             for tm in range(TM5):
-                reg_a[tm] = As[thread_row + tm, dk]
+                reg_a[tm] = As[dk, thread_row + tm]  # read from transposed As
             for tn in range(TN5):
                 reg_b[tn] = Bs[dk, thread_col + tn]
-            # TM5 x TN5 = 64 FMAs from only 16 register reads
             for tm in range(TM5):
                 for tn in range(TN5):
                     acc[tm, tn] += reg_a[tm] * reg_b[tn]
